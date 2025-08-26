@@ -1,62 +1,155 @@
-name: Keep Hugging Face Space Awake (bash)
+name: Keep Hugging Face Space Awake (adaptive)
 
+# 每 30 分钟跑一次（每小时的 :00 与 :30）
 on:
   schedule:
-    - cron: "0 * * * *"  # 每小时执行一次
+    - cron: "*/30 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
     env:
-      URL: "https://asdiuzbxkcj-ccn.hf.space/"
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_SPACE_USER: ${{ secrets.HF_SPACE_USER }}    # 请在 repo secrets 里设置
+      HF_SPACE_NAME: ${{ secrets.HF_SPACE_NAME }}    # 请在 repo secrets 里设置
       MAX_ATTEMPTS: 3
       BASE_SLEEP: 5
     steps:
-      - name: Ping Space (detect 404 / placeholder)
+      - name: Prepare
+        run: |
+          set -euo pipefail
+          # 安装 jq
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Detect space info and scheduling policy
+        id: detect
+        run: |
+          set -euo pipefail
+          API="https://huggingface.co/api/spaces/${HF_SPACE_USER}/${HF_SPACE_NAME}"
+          echo "Querying space info: $API"
+          # 获取 Space JSON（带 token）
+          resp=$(curl -sS -H "Authorization: Bearer ${HF_TOKEN}" "$API")
+          if [ -z "$resp" ]; then
+            echo "::error::Empty response from space API"
+            echo "status=api_error" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "$resp" | jq '.' > space_info.json
+          echo "Saved space_info.json"
+
+          # 尝试提取 host 与硬件请求字段
+          host=$(echo "$resp" | jq -r '.host // .runtime.domains[0].domain // empty')
+          hardware_req=$(echo "$resp" | jq -r '.runtime.hardware.requested // .runtime.hardware.current // empty')
+
+          echo "host=$host"
+          echo "hardware_requested=$hardware_req"
+
+          # 判定是否为 GPU（简单规则：字段中包含 t4, a10g, a100, l4, gpu 等视为 GPU）
+          is_gpu=0
+          if echo "$hardware_req" | grep -Eiq "t4|a10g|a100|l4|gpu|v100|p100|a40|l40|a10g"; then
+            is_gpu=1
+          fi
+
+          # 当前分钟（UTC） — GitHub cron 使用 UTC
+          minute=$(date -u +%M)
+          echo "current_minute_utc=$minute"
+
+          echo "is_gpu=$is_gpu" >> $GITHUB_OUTPUT
+          echo "host=$host" >> $GITHUB_OUTPUT
+          echo "hardware_requested=$hardware_req" >> $GITHUB_OUTPUT
+          echo "current_minute_utc=$minute" >> $GITHUB_OUTPUT
+
+      - name: Maybe skip (GPU runs only on :00)
+        if: steps.detect.outputs.is_gpu == '1'
+        run: |
+          set -euo pipefail
+          minute=${{ steps.detect.outputs.current_minute_utc }}
+          echo "GPU space detected; current minute (UTC): $minute"
+          if [ "$minute" != "00" ]; then
+            echo "Skipping this run because GPU spaces are only pinged once per hour at :00."
+            exit 0
+          fi
+          echo "Proceeding (GPU run at :00)."
+
+      - name: Keepalive ping attempts
         id: ping
         run: |
           set -euo pipefail
+          HOST="${{ steps.detect.outputs.host }}"
+          if [ -z "$HOST" ]; then
+            echo "::error::No host detected from API (cannot ping)." >&2
+            exit 1
+          fi
 
-          echo "Ping $URL"
-          attempt=1
-          success=0
+          MAX_ATTEMPTS=${MAX_ATTEMPTS:-3}
+          BASE_SLEEP=${BASE_SLEEP:-5}
+
           tmpbody="response_body.txt"
           tmphead="response_headers.txt"
+          success=0
 
+          # candidate endpoints (按优先级尝试)
+          endpoints=(
+            "${HOST%/}/api/predict"
+            "${HOST%/}/run/predict"
+            "${HOST%/}/api/queue/join"
+          )
+
+          attempt=1
           while [ $attempt -le $MAX_ATTEMPTS ]; do
-            echo "Attempt $attempt ..."
+            echo "Overall attempt $attempt / $MAX_ATTEMPTS ..."
+            for ep in "${endpoints[@]}"; do
+              echo "Trying endpoint: $ep"
+              # 保存 header 和 body，超时 30s
+              http_code=$(curl -sS -D "$tmphead" -o "$tmpbody" -w "%{http_code}" \
+                -H "Authorization: Bearer ${HF_TOKEN}" \
+                -H "Content-Type: application/json" \
+                -m 30 \
+                -X POST \
+                -d '{"data":["__hf_ping__"]}' \
+                "$ep" || echo "000")
 
-            # 跟随重定向 (-L)，保存 header 和 body
-            http_code=$(curl -sSL -D "$tmphead" -o "$tmpbody" -w "%{http_code}" \
-                        -H "User-Agent: Github-Actions-Heartbeat/1.0" "$URL" || echo "000")
-            body_size=$(wc -c < "$tmpbody" || echo 0)
+              echo " -> HTTP $http_code, body bytes: $(wc -c < "$tmpbody" || echo 0)"
+              echo "---- response headers (first 20 lines) ----"
+              head -n 20 "$tmphead" || true
+              echo "---- response body (first 200 chars) ----"
+              head -c 200 "$tmpbody" | sed -n '1,10p' || true
+              echo "-------------------------------------------"
 
-            echo "HTTP $http_code, body ${body_size} bytes"
-            head -n 20 "$tmphead" || true
-            head -n 20 "$tmpbody" || true
-
-            if [ "$http_code" = "200" ]; then
-              if grep -qiE "404|not found|can'?t find the page|sorry, we can.?t find|page you are looking for" "$tmpbody"; then
-                echo "::warning::Page contains 404/Not Found text — not running."
-              elif grep -qiE "gradio|gradio-app|gradio-root|window.Gradio|app\.js|src=\"/static/frontend" "$tmpbody"; then
-                echo "✅ Space looks awake (runtime markers present)."
+              if [ "$http_code" = "200" ]; then
+                echo "✅ Ping succeeded to $ep (HTTP 200)."
                 success=1
-                break
-              elif [ "$body_size" -ge 3000 ]; then
-                echo "✅ Large HTML body and no 404 markers — treating as awake."
-                success=1
-                break
-              else
-                echo "::warning::Body small ($body_size bytes), no runtime markers — likely placeholder."
+                break 2
               fi
-            else
-              echo "::warning::HTTP $http_code — not ready."
+
+              # 某些 endpoint 可能返回 202/204 when accepted — treat 2xx as success
+              if echo "$http_code" | grep -E -q "^2"; then
+                echo "✅ Ping returned 2xx ($http_code) — treat as success."
+                success=1
+                break 2
+              fi
+
+              # 如果 401/403，可能 token 没权限
+              if [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+                echo "::warning::Endpoint $ep returned $http_code — check HF_TOKEN permissions."
+              fi
+
+              # else try next endpoint
+            done
+
+            if [ $success -eq 1 ]; then
+              break
             fi
 
             if [ $attempt -lt $MAX_ATTEMPTS ]; then
               sleep_seconds=$(( BASE_SLEEP * attempt ))
-              echo "Retrying after $sleep_seconds seconds..."
+              echo "No success yet. Sleeping $sleep_seconds seconds before overall retry..."
               sleep $sleep_seconds
             fi
             attempt=$((attempt + 1))
@@ -64,18 +157,24 @@ jobs:
 
           if [ $success -eq 1 ]; then
             echo "success=true" >> $GITHUB_OUTPUT
+            # 清理临时文件
+            rm -f "$tmpbody" "$tmphead" || true
+            exit 0
           else
             echo "success=false" >> $GITHUB_OUTPUT
+            echo "::error::All ping attempts failed."
+            # 保存 artifact path names for the next step
+            echo "failed_body=$PWD/$tmpbody" >> $GITHUB_OUTPUT
+            echo "failed_headers=$PWD/$tmphead" >> $GITHUB_OUTPUT
+            # keep files for upload
             exit 1
           fi
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
-      - name: Upload response as artifact (on failure)
-        if: failure()  # 仅在上一步失败时执行
+      - name: Upload failure artifacts
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: failed-response
+          name: hf-space-failed-response
           path: |
             response_body.txt
             response_headers.txt
