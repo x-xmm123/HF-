@@ -1,45 +1,144 @@
-name: Keep Hugging Face Spaces Awake
+name: Keep Multiple Hugging Face Spaces Awake
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # 每 30 分钟执行一次
+    - cron: "*/30 * * * *"  # 每 30 分钟执行（UTC）
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   keepalive:
     runs-on: ubuntu-latest
+    env:
+      MAX_ATTEMPTS: 3
+      BASE_SLEEP: 5
     steps:
-      - name: Keep Space Alive
+      - name: Prepare environment
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Keep multiple spaces alive
+        id: worker
         run: |
           set -euo pipefail
 
           HF_TOKEN="${{ secrets.HF_TOKEN }}"
-          SPACE_USER="${{ secrets.HF_SPACE_USER }}"
-          SPACE_NAME="${{ secrets.HF_SPACE_NAME }}"
+          HF_SPACES_RAW="${{ secrets.HF_SPACES }}" || true
 
-          url="https://huggingface.co/api/spaces/$SPACE_USER/$SPACE_NAME"
-
-          echo "Fetching Space info from $url ..."
-          response=$(curl -sS -H "Authorization: Bearer $HF_TOKEN" "$url")
-
-          stage=$(echo "$response" | jq -r '.runtime.stage')
-          hardware=$(echo "$response" | jq -r '.runtime.hardware.requested')
-
-          echo "Stage: $stage"
-          echo "Hardware: $hardware"
-
-          minute=$(date +%M)
-
-          if [[ "$hardware" == "cpu-basic" || "$hardware" == "cpu-upgrade" ]]; then
-            echo "CPU Space detected, always pinging..."
-            curl -sS -H "Authorization: Bearer $HF_TOKEN" "$url" >/dev/null
-          elif [[ "$hardware" == gpu* ]]; then
-            if [[ "$minute" == "00" ]]; then
-              echo "GPU Space detected, and it's the top of the hour, pinging..."
-              curl -sS -H "Authorization: Bearer $HF_TOKEN" "$url" >/dev/null
-            else
-              echo "GPU Space detected, but not the top of the hour, skipping ping."
-            fi
-          else
-            echo "Unknown hardware type: $hardware, skipping..."
+          if [ -z "${HF_TOKEN:-}" ]; then
+            echo "::error::HF_TOKEN secret is not set"
+            echo "any_failed=true" >> $GITHUB_OUTPUT
+            exit 1
           fi
+
+          if [ -z "${HF_SPACES_RAW:-}" ]; then
+            echo "::error::HF_SPACES secret is not set or empty"
+            echo "any_failed=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          # 将 HF_SPACES_RAW 按逗号或换行拆分成数组（并 trim 空格）
+          IFS=$'\n' read -r -d '' -a tmparr < <(printf "%s\0" "$(echo "$HF_SPACES_RAW" | sed 's/,/\n/g')")
+          spaces=()
+          for s in "${tmparr[@]}"; do
+            # trim spaces
+            s="$(echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -n "$s" ] && spaces+=("$s")
+          done
+
+          if [ ${#spaces[@]} -eq 0 ]; then
+            echo "::error::No valid spaces found in HF_SPACES"
+            echo "any_failed=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          minute_utc=$(date -u +%M)
+          echo "Current UTC minute: $minute_utc"
+
+          any_failed=0
+
+          for space in "${spaces[@]}"; do
+            echo "=============================="
+            echo "Processing space: $space"
+            safe_name="$(echo "$space" | sed 's/[^a-zA-Z0-9._-]/_/g')"
+            body_file="response_${safe_name}.json"
+            header_file="response_${safe_name}.headers"
+
+            api_url="https://huggingface.co/api/spaces/$space"
+            echo "Querying API: $api_url"
+
+            success=0
+            attempt=1
+            while [ $attempt -le ${MAX_ATTEMPTS} ]; do
+              echo "Attempt $attempt / ${MAX_ATTEMPTS} for $space ..."
+              http_code=$(curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" -H "Authorization: Bearer ${HF_TOKEN}" "$api_url" || echo "000")
+              echo " -> HTTP $http_code, body bytes: $(wc -c < "$body_file" || echo 0)"
+
+              if [ "$http_code" = "200" ]; then
+                # 解析 runtime & hardware
+                hw_req=$(jq -r '.runtime.hardware.requested // .runtime.hardware.current // empty' "$body_file" 2>/dev/null || true)
+                runtime_stage=$(jq -r '.runtime.stage // empty' "$body_file" 2>/dev/null || true)
+                echo "runtime.stage: ${runtime_stage:-<empty>}"
+                echo "hardware.requested/current: ${hw_req:-<empty>}"
+
+                # 判定是否 GPU
+                is_gpu=0
+                if echo "$hw_req" | grep -Eiq "t4|a10g|a100|l4|gpu|v100|p100|a40|l40"; then
+                  is_gpu=1
+                fi
+
+                # 如果是 GPU，但不是整点，则跳过实际唤醒（视为 skip，不当做失败）
+                if [ "$is_gpu" -eq 1 ] && [ "$minute_utc" != "00" ]; then
+                  echo "GPU space detected but current minute is $minute_utc (not :00) — skipping ping for this run."
+                  success=1
+                  break
+                fi
+
+                # 对于大多数 Space，GET API 已经能唤醒/保持运行； treat 200 as success
+                echo "✅ Space API reachable (200). treating as success."
+                success=1
+                break
+              else
+                echo "::warning::API returned $http_code for $space (attempt $attempt)."
+              fi
+
+              # 重试等待
+              if [ $attempt -lt ${MAX_ATTEMPTS} ]; then
+                sleep_seconds=$(( BASE_SLEEP * attempt ))
+                echo "Sleeping $sleep_seconds seconds before retry..."
+                sleep $sleep_seconds
+              fi
+              attempt=$((attempt + 1))
+            done
+
+            if [ $success -eq 1 ]; then
+              echo "Space $space: success."
+              # 清理小文件以节省 artifact 空间（只保留失败时）
+              rm -f "$body_file" "$header_file" || true
+            else
+              echo "::error::Space $space: all attempts failed — leaving response files for artifact."
+              any_failed=1
+              # keep files for upload
+            fi
+
+            echo "=============================="
+          done
+
+          if [ $any_failed -eq 1 ]; then
+            echo "any_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "any_failed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload failure artifacts
+        if: steps.worker.outputs.any_failed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hf-space-failed-responses
+          path: |
+            response_*.json
+            response_*.headers
