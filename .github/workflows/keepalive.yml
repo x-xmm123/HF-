@@ -1,4 +1,4 @@
-name: Keep Multiple Hugging Face Spaces Awake (per-space tokens)
+name: HF is alive
 
 on:
   schedule:
