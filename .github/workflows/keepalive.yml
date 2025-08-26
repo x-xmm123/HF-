@@ -1,4 +1,4 @@
-name: Keep Multiple Hugging Face Spaces Awake
+name: Keep Multiple Hugging Face Spaces Awake (per-space tokens)
 
 on:
   schedule:
@@ -8,12 +8,13 @@ on:
 permissions:
   contents: read
 
+env:
+  MAX_ATTEMPTS: 3
+  BASE_SLEEP: 5
+
 jobs:
   keepalive:
     runs-on: ubuntu-latest
-    env:
-      MAX_ATTEMPTS: 3
-      BASE_SLEEP: 5
     steps:
       - name: Prepare environment
         run: |
@@ -21,108 +22,182 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Keep multiple spaces alive
+      - name: Keep multiple spaces alive (per-space tokens)
         id: worker
+        env:
+          HF_SPACES_RAW: ${{ secrets.HF_SPACES }}
+          HF_TOKENS_RAW: ${{ secrets.HF_TOKENS }}
+          HF_ENDPOINTS_RAW: ${{ secrets.HF_ENDPOINTS || '' }}
         run: |
           set -euo pipefail
 
-          HF_TOKEN="${{ secrets.HF_TOKEN }}"
-          HF_SPACES_RAW="${{ secrets.HF_SPACES }}" || true
-
-          if [ -z "${HF_TOKEN:-}" ]; then
-            echo "::error::HF_TOKEN secret is not set"
-            echo "any_failed=true" >> $GITHUB_OUTPUT
-            exit 1
-          fi
-
+          # ---- Parse inputs into arrays (comma or newline separated) ----
+          # HF_SPACES_RAW and HF_TOKENS_RAW are required and must have same count
           if [ -z "${HF_SPACES_RAW:-}" ]; then
             echo "::error::HF_SPACES secret is not set or empty"
             echo "any_failed=true" >> $GITHUB_OUTPUT
             exit 1
           fi
-
-          # 将 HF_SPACES_RAW 按逗号或换行拆分成数组（并 trim 空格）
-          IFS=$'\n' read -r -d '' -a tmparr < <(printf "%s\0" "$(echo "$HF_SPACES_RAW" | sed 's/,/\n/g')")
-          spaces=()
-          for s in "${tmparr[@]}"; do
-            # trim spaces
-            s="$(echo "$s" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            [ -n "$s" ] && spaces+=("$s")
-          done
-
-          if [ ${#spaces[@]} -eq 0 ]; then
-            echo "::error::No valid spaces found in HF_SPACES"
+          if [ -z "${HF_TOKENS_RAW:-}" ]; then
+            echo "::error::HF_TOKENS secret is not set or empty"
             echo "any_failed=true" >> $GITHUB_OUTPUT
             exit 1
           fi
 
+          # helper: split a raw string (comma or newline separated) into bash array
+          split_to_array() {
+            raw="$1"
+            # convert commas to newlines, remove \r, then read into array
+            mapfile -t arr < <(printf "%s" "$raw" | tr ',' '\n' | sed 's/\r//g' | sed '/^[[:space:]]*$/d')
+            # trim whitespace on each element
+            for i in "${!arr[@]}"; do
+              arr[$i]="$(echo "${arr[$i]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            done
+            printf '%s\0' "${arr[@]}"
+          }
+
+          # populate arrays
+          IFS= read -r -d '' -a SPACES < <(split_to_array "$HF_SPACES_RAW") || true
+          IFS= read -r -d '' -a TOKENS < <(split_to_array "$HF_TOKENS_RAW") || true
+          IFS= read -r -d '' -a ENDPOINTS < <(split_to_array "$HF_ENDPOINTS_RAW") || true
+
+          # If ENDPOINTS shorter, pad with empty strings
+          if [ ${#ENDPOINTS[@]} -lt ${#SPACES[@]} ]; then
+            for ((i=${#ENDPOINTS[@]}; i<${#SPACES[@]}; i++)); do
+              ENDPOINTS+=("")
+            done
+          fi
+
+          # Validate counts
+          if [ ${#SPACES[@]} -ne ${#TOKENS[@]} ]; then
+            echo "::error::HF_SPACES and HF_TOKENS count mismatch (must be same number and order)"
+            echo "HF_SPACES count: ${#SPACES[@]}, HF_TOKENS count: ${#TOKENS[@]}"
+            echo "any_failed=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "Found ${#SPACES[@]} spaces to process."
           minute_utc=$(date -u +%M)
           echo "Current UTC minute: $minute_utc"
 
           any_failed=0
 
-          for space in "${spaces[@]}"; do
+          for idx in "${!SPACES[@]}"; do
+            space="${SPACES[$idx]}"
+            token="${TOKENS[$idx]}"
+            endpoint="${ENDPOINTS[$idx]:-}"
+
             echo "=============================="
-            echo "Processing space: $space"
+            echo "Processing [$((idx+1))/${#SPACES[@]}] space: $space"
             safe_name="$(echo "$space" | sed 's/[^a-zA-Z0-9._-]/_/g')"
             body_file="response_${safe_name}.json"
             header_file="response_${safe_name}.headers"
+            ping_body_file="ping_response_${safe_name}.txt"
+            ping_header_file="ping_headers_${safe_name}.headers"
 
-            api_url="https://huggingface.co/api/spaces/$space"
-            echo "Querying API: $api_url"
+            # 1) First query metadata API to get runtime/hardware (always use metadata to decide GPU scheduling)
+            meta_api="https://huggingface.co/api/spaces/$space"
+            echo "Querying metadata: $meta_api"
+            meta_http=$(curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" \
+                        -H "Authorization: Bearer $token" \
+                        -H "Accept: application/json" \
+                        "$meta_api" || echo "000")
+            echo " -> metadata HTTP $meta_http, body bytes: $(wc -c < "$body_file" || echo 0)"
 
+            if [ "$meta_http" != "200" ]; then
+              echo "::warning::Failed to read metadata for $space (HTTP $meta_http). Will still attempt ping unless metadata indicates skip."
+              # leave body/header for artifact
+            fi
+
+            # parse hardware and runtime.stage when possible
+            hw_req=$(jq -r '.runtime.hardware.requested // .runtime.hardware.current // empty' "$body_file" 2>/dev/null || true)
+            runtime_stage=$(jq -r '.runtime.stage // empty' "$body_file" 2>/dev/null || true)
+            echo "runtime.stage: ${runtime_stage:-<empty>}"
+            echo "hardware.requested/current: ${hw_req:-<empty>}"
+
+            # decide GPU vs CPU
+            is_gpu=0
+            if echo "$hw_req" | grep -Eiq "t4|a10g|a100|l4|gpu|v100|p100|a40|l40"; then
+              is_gpu=1
+            fi
+
+            # If GPU and not top of hour, skip (treat as success)
+            if [ "$is_gpu" -eq 1 ] && [ "$minute_utc" != "00" ]; then
+              echo "GPU space detected but current minute is $minute_utc (not :00) — skipping ping for this run (ok)."
+              # clean small files and continue
+              rm -f "$body_file" "$header_file" || true
+              continue
+            fi
+
+            # 2) Determine ping endpoint: prefer user-provided endpoint; otherwise use metadata API (GET)
+            if [ -n "$endpoint" ]; then
+              ping_url="$endpoint"
+              # decide whether to POST (common for predict) or GET: we will POST JSON if endpoint ends with /predict or contains /api/
+              method="POST"
+              data='{"data":["__hf_ping__"]}'
+            else
+              ping_url="$meta_api"   # GET on metadata API should awaken most Spaces
+              method="GET"
+              data=""
+            fi
+
+            echo "Ping URL: $ping_url (method: $method)"
+
+            # 3) Ping with retries
             success=0
             attempt=1
             while [ $attempt -le ${MAX_ATTEMPTS} ]; do
-              echo "Attempt $attempt / ${MAX_ATTEMPTS} for $space ..."
-              http_code=$(curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" -H "Authorization: Bearer ${HF_TOKEN}" "$api_url" || echo "000")
-              echo " -> HTTP $http_code, body bytes: $(wc -c < "$body_file" || echo 0)"
-
-              if [ "$http_code" = "200" ]; then
-                # 解析 runtime & hardware
-                hw_req=$(jq -r '.runtime.hardware.requested // .runtime.hardware.current // empty' "$body_file" 2>/dev/null || true)
-                runtime_stage=$(jq -r '.runtime.stage // empty' "$body_file" 2>/dev/null || true)
-                echo "runtime.stage: ${runtime_stage:-<empty>}"
-                echo "hardware.requested/current: ${hw_req:-<empty>}"
-
-                # 判定是否 GPU
-                is_gpu=0
-                if echo "$hw_req" | grep -Eiq "t4|a10g|a100|l4|gpu|v100|p100|a40|l40"; then
-                  is_gpu=1
-                fi
-
-                # 如果是 GPU，但不是整点，则跳过实际唤醒（视为 skip，不当做失败）
-                if [ "$is_gpu" -eq 1 ] && [ "$minute_utc" != "00" ]; then
-                  echo "GPU space detected but current minute is $minute_utc (not :00) — skipping ping for this run."
-                  success=1
-                  break
-                fi
-
-                # 对于大多数 Space，GET API 已经能唤醒/保持运行； treat 200 as success
-                echo "✅ Space API reachable (200). treating as success."
-                success=1
-                break
+              echo "Ping attempt $attempt / ${MAX_ATTEMPTS} ..."
+              if [ "$method" = "GET" ]; then
+                code=$(curl -sS -D "$ping_header_file" -o "$ping_body_file" -w "%{http_code}" \
+                       -H "Authorization: Bearer $token" \
+                       -H "Accept: application/json" \
+                       --max-time 30 \
+                       "$ping_url" || echo "000")
               else
-                echo "::warning::API returned $http_code for $space (attempt $attempt)."
+                code=$(curl -sS -D "$ping_header_file" -o "$ping_body_file" -w "%{http_code}" \
+                       -H "Authorization: Bearer $token" \
+                       -H "Content-Type: application/json" \
+                       -m 30 \
+                       -X POST -d "$data" \
+                       "$ping_url" || echo "000")
               fi
 
-              # 重试等待
+              echo " -> HTTP $code, ping body bytes: $(wc -c < "$ping_body_file" || echo 0)"
+              echo "---- ping headers (first 20 lines) ----"
+              head -n 20 "$ping_header_file" || true
+              echo "---- ping body (first 200 chars) ----"
+              head -c 200 "$ping_body_file" | sed -n '1,10p' || true
+              echo "-------------------------------------------"
+
+              # treat any 2xx as success
+              if echo "$code" | grep -E -q "^2"; then
+                echo "✅ Ping success (HTTP $code)."
+                success=1
+                break
+              fi
+
+              # handle auth issues explicitly
+              if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+                echo "::warning::Ping returned $code — check the token permissions for $space."
+              fi
+
               if [ $attempt -lt ${MAX_ATTEMPTS} ]; then
                 sleep_seconds=$(( BASE_SLEEP * attempt ))
-                echo "Sleeping $sleep_seconds seconds before retry..."
+                echo "Sleeping $sleep_seconds seconds before next attempt..."
                 sleep $sleep_seconds
               fi
               attempt=$((attempt + 1))
             done
 
             if [ $success -eq 1 ]; then
-              echo "Space $space: success."
-              # 清理小文件以节省 artifact 空间（只保留失败时）
-              rm -f "$body_file" "$header_file" || true
+              echo "Space $space: ping succeeded."
+              # cleanup small files
+              rm -f "$body_file" "$header_file" "$ping_body_file" "$ping_header_file" || true
             else
-              echo "::error::Space $space: all attempts failed — leaving response files for artifact."
+              echo "::error::Space $space: all ping attempts failed — leaving response files for artifact."
               any_failed=1
-              # keep files for upload
+              # keep files for artifact upload
             fi
 
             echo "=============================="
@@ -142,3 +217,5 @@ jobs:
           path: |
             response_*.json
             response_*.headers
+            ping_response_*.txt
+            ping_headers_*.headers
