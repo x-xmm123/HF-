@@ -13,29 +13,69 @@ jobs:
       MAX_ATTEMPTS: 3
       BASE_SLEEP: 5
     steps:
-      - name: Ping Space with retries
+      - name: Ping Space (detect 404 / placeholder)
+        id: ping
         run: |
           set -euo pipefail
 
           echo "Ping $URL"
           attempt=1
+          success=0
+          tmpbody="response_body.txt"
+          tmphead="response_headers.txt"
+
           while [ $attempt -le $MAX_ATTEMPTS ]; do
-            status=$(curl -sSL -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $HF_TOKEN" "$URL" || echo "000")
-            echo "Attempt $attempt -> HTTP $status"
-            if [ "$status" = "200" ] || [ "$status" = "302" ]; then
-              echo "✅ Space reachable (HTTP $status)."
-              exit 0
+            echo "Attempt $attempt ..."
+
+            # 跟随重定向 (-L)，保存 header 和 body
+            http_code=$(curl -sSL -D "$tmphead" -o "$tmpbody" -w "%{http_code}" \
+                        -H "User-Agent: Github-Actions-Heartbeat/1.0" "$URL" || echo "000")
+            body_size=$(wc -c < "$tmpbody" || echo 0)
+
+            echo "HTTP $http_code, body ${body_size} bytes"
+            head -n 20 "$tmphead" || true
+            head -n 20 "$tmpbody" || true
+
+            if [ "$http_code" = "200" ]; then
+              if grep -qiE "404|not found|can'?t find the page|sorry, we can.?t find|page you are looking for" "$tmpbody"; then
+                echo "::warning::Page contains 404/Not Found text — not running."
+              elif grep -qiE "gradio|gradio-app|gradio-root|window.Gradio|app\.js|src=\"/static/frontend" "$tmpbody"; then
+                echo "✅ Space looks awake (runtime markers present)."
+                success=1
+                break
+              elif [ "$body_size" -ge 3000 ]; then
+                echo "✅ Large HTML body and no 404 markers — treating as awake."
+                success=1
+                break
+              else
+                echo "::warning::Body small ($body_size bytes), no runtime markers — likely placeholder."
+              fi
+            else
+              echo "::warning::HTTP $http_code — not ready."
             fi
 
             if [ $attempt -lt $MAX_ATTEMPTS ]; then
               sleep_seconds=$(( BASE_SLEEP * attempt ))
-              echo "Waiting $sleep_seconds seconds before retry..."
+              echo "Retrying after $sleep_seconds seconds..."
               sleep $sleep_seconds
             fi
             attempt=$((attempt + 1))
           done
 
-          echo "::error::All attempts failed. Last HTTP status: $status"
-          exit 1
+          if [ $success -eq 1 ]; then
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+      - name: Upload response as artifact (on failure)
+        if: failure()  # 仅在上一步失败时执行
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-response
+          path: |
+            response_body.txt
+            response_headers.txt
