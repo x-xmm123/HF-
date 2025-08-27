@@ -1,79 +1,73 @@
-name: HF remains active
+name: HF Stay active
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"  # 每 30 分钟执行（UTC）
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-env:
-  MAX_ATTEMPTS: 3
-  BASE_SLEEP: 5
+  schedule:
+    - cron: '0 * * * *' # 每小时整点运行（示例），按需修改或移除
 
 jobs:
-  keepalive:
+  ping-spaces:
     runs-on: ubuntu-latest
+    env:
+      # 默认值可按需修改
+      MAX_ATTEMPTS: 3
+      BASE_SLEEP: 5
     steps:
-      - name: Prepare environment
-        run: |
-          set -euo pipefail
-          sudo apt-get update -y
-          sudo apt-get install -y jq
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Keep multiple spaces alive (per-space tokens)
-        id: worker
-        env:
-          HF_SPACES_RAW: ${{ secrets.HF_SPACES }}
-          HF_TOKENS_RAW: ${{ secrets.HF_TOKENS }}
-          HF_ENDPOINTS_RAW: ${{ secrets.HF_ENDPOINTS || '' }}
+      - name: Run HF Spaces ping script
+        id: ping
+        # 直接把脚本内嵌在这里，脚本会把 any_failed 写入 $GITHUB_OUTPUT
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          
+          # ---- Inputs (传入 secrets/vars) ----
+          # HF_SPACES_RAW and HF_TOKENS_RAW 必须设置（逗号或换行分隔）
+          HF_SPACES_RAW="${{ secrets.HF_SPACES_RAW }}"
+          HF_TOKENS_RAW="${{ secrets.HF_TOKENS_RAW }}"
+          HF_ENDPOINTS_RAW="${{ secrets.HF_ENDPOINTS_RAW || '' }}"
 
-          # ---- Parse inputs into arrays (comma or newline separated) ----
-          # HF_SPACES_RAW and HF_TOKENS_RAW are required and must have same count
+          MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
+          BASE_SLEEP="${BASE_SLEEP:-5}"
+
           if [ -z "${HF_SPACES_RAW:-}" ]; then
-            echo "::error::HF_SPACES secret is not set or empty"
-            echo "any_failed=true" >> $GITHUB_OUTPUT
-            exit 1
+            echo "::error::HF_SPACES_RAW secret is not set or empty"
+            echo "any_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           if [ -z "${HF_TOKENS_RAW:-}" ]; then
-            echo "::error::HF_TOKENS secret is not set or empty"
-            echo "any_failed=true" >> $GITHUB_OUTPUT
-            exit 1
+            echo "::error::HF_TOKENS_RAW secret is not set or empty"
+            echo "any_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # helper: split a raw string (comma or newline separated) into bash array
           split_to_array() {
             raw="$1"
-            # convert commas to newlines, remove \r, then read into array
             mapfile -t arr < <(printf "%s" "$raw" | tr ',' '\n' | sed 's/\r//g' | sed '/^[[:space:]]*$/d')
-            # trim whitespace on each element
             for i in "${!arr[@]}"; do
               arr[$i]="$(echo "${arr[$i]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             done
             printf '%s\0' "${arr[@]}"
           }
 
-          # populate arrays
+          # populate arrays (注意用 -d '' 读取 NUL 分隔)
           IFS= read -r -d '' -a SPACES < <(split_to_array "$HF_SPACES_RAW") || true
           IFS= read -r -d '' -a TOKENS < <(split_to_array "$HF_TOKENS_RAW") || true
           IFS= read -r -d '' -a ENDPOINTS < <(split_to_array "$HF_ENDPOINTS_RAW") || true
 
-          # If ENDPOINTS shorter, pad with empty strings
           if [ ${#ENDPOINTS[@]} -lt ${#SPACES[@]} ]; then
             for ((i=${#ENDPOINTS[@]}; i<${#SPACES[@]}; i++)); do
               ENDPOINTS+=("")
             done
           fi
 
-          # Validate counts
           if [ ${#SPACES[@]} -ne ${#TOKENS[@]} ]; then
             echo "::error::HF_SPACES and HF_TOKENS count mismatch (must be same number and order)"
             echo "HF_SPACES count: ${#SPACES[@]}, HF_TOKENS count: ${#TOKENS[@]}"
-            echo "any_failed=true" >> $GITHUB_OUTPUT
-            exit 1
+            echo "any_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           echo "Found ${#SPACES[@]} spaces to process."
@@ -95,7 +89,6 @@ jobs:
             ping_body_file="ping_response_${safe_name}.txt"
             ping_header_file="ping_headers_${safe_name}.headers"
 
-            # 1) First query metadata API to get runtime/hardware (always use metadata to decide GPU scheduling)
             meta_api="https://huggingface.co/api/spaces/$space"
             echo "Querying metadata: $meta_api"
             meta_http=$(curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" \
@@ -106,44 +99,37 @@ jobs:
 
             if [ "$meta_http" != "200" ]; then
               echo "::warning::Failed to read metadata for $space (HTTP $meta_http). Will still attempt ping unless metadata indicates skip."
-              # leave body/header for artifact
             fi
 
-            # parse hardware and runtime.stage when possible
             hw_req=$(jq -r '.runtime.hardware.requested // .runtime.hardware.current // empty' "$body_file" 2>/dev/null || true)
             runtime_stage=$(jq -r '.runtime.stage // empty' "$body_file" 2>/dev/null || true)
             echo "runtime.stage: ${runtime_stage:-<empty>}"
             echo "hardware.requested/current: ${hw_req:-<empty>}"
 
-            # decide GPU vs CPU
             is_gpu=0
             if echo "$hw_req" | grep -Eiq "t4|a10g|a100|l4|gpu|v100|p100|a40|l40"; then
               is_gpu=1
             fi
 
-            # If GPU and not top of hour, skip (treat as success)
+            # 如果 GPU 且不是整点，跳过（视为 ok，不视为失败）
             if [ "$is_gpu" -eq 1 ] && [ "$minute_utc" != "00" ]; then
               echo "GPU space detected but current minute is $minute_utc (not :00) — skipping ping for this run (ok)."
-              # clean small files and continue
               rm -f "$body_file" "$header_file" || true
               continue
             fi
 
-            # 2) Determine ping endpoint: prefer user-provided endpoint; otherwise use metadata API (GET)
+            # 决定 ping URL & method
             if [ -n "$endpoint" ]; then
               ping_url="$endpoint"
-              # decide whether to POST (common for predict) or GET: we will POST JSON if endpoint ends with /predict or contains /api/
               method="POST"
               data='{"data":["__hf_ping__"]}'
             else
-              ping_url="$meta_api"   # GET on metadata API should awaken most Spaces
+              ping_url="$meta_api"
               method="GET"
               data=""
             fi
-
             echo "Ping URL: $ping_url (method: $method)"
 
-            # 3) Ping with retries
             success=0
             attempt=1
             while [ $attempt -le ${MAX_ATTEMPTS} ]; do
@@ -170,14 +156,12 @@ jobs:
               head -c 200 "$ping_body_file" | sed -n '1,10p' || true
               echo "-------------------------------------------"
 
-              # treat any 2xx as success
               if echo "$code" | grep -E -q "^2"; then
                 echo "✅ Ping success (HTTP $code)."
                 success=1
                 break
               fi
 
-              # handle auth issues explicitly
               if [ "$code" = "401" ] || [ "$code" = "403" ]; then
                 echo "::warning::Ping returned $code — check the token permissions for $space."
               fi
@@ -192,25 +176,31 @@ jobs:
 
             if [ $success -eq 1 ]; then
               echo "Space $space: ping succeeded."
-              # cleanup small files
               rm -f "$body_file" "$header_file" "$ping_body_file" "$ping_header_file" || true
             else
               echo "::error::Space $space: all ping attempts failed — leaving response files for artifact."
               any_failed=1
-              # keep files for artifact upload
+              # 保留文件供 artifact 上传
             fi
 
             echo "=============================="
           done
 
+          # 写入 step 输出给后续步骤判断（注意：这里不用 exit 非 0）
           if [ $any_failed -eq 1 ]; then
-            echo "any_failed=true" >> $GITHUB_OUTPUT
+            echo "any_failed=true" >> "$GITHUB_OUTPUT"
           else
-            echo "any_failed=false" >> $GITHUB_OUTPUT
+            echo "any_failed=false" >> "$GITHUB_OUTPUT"
           fi
+          exit 0
+        env:
+          # 把需要的 secret 传给脚本
+          HF_SPACES_RAW: ${{ secrets.HF_SPACES_RAW }}
+          HF_TOKENS_RAW: ${{ secrets.HF_TOKENS_RAW }}
+          HF_ENDPOINTS_RAW: ${{ secrets.HF_ENDPOINTS_RAW || '' }}
 
       - name: Upload failure artifacts
-        if: steps.worker.outputs.any_failed == 'true'
+        if: steps.ping.outputs.any_failed == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: hf-space-failed-responses
@@ -219,3 +209,10 @@ jobs:
             response_*.headers
             ping_response_*.txt
             ping_headers_*.headers
+          retention-days: 3
+
+      - name: Fail job if any ping failed
+        if: steps.ping.outputs.any_failed == 'true'
+        run: |
+          echo "One or more Spaces failed ping. Failing the job as requested."
+          exit 1
