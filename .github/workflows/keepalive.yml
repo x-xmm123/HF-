@@ -9,7 +9,6 @@ jobs:
   ping-spaces:
     runs-on: ubuntu-latest
     env:
-      # 默认值可按需修改
       MAX_ATTEMPTS: 3
       BASE_SLEEP: 5
     steps:
@@ -18,15 +17,11 @@ jobs:
 
       - name: Run HF Spaces ping script
         id: ping
-        # 直接把脚本内嵌在这里，脚本会把 any_failed 写入 $GITHUB_OUTPUT
         run: |
           set -uo pipefail
           
-          # ---- Inputs (传入 secrets/vars) ----
-          # HF_SPACES_RAW and HF_TOKENS_RAW 必须设置（逗号或换行分隔）
           HF_SPACES_RAW="${{ secrets.HF_SPACES_RAW }}"
           HF_TOKENS_RAW="${{ secrets.HF_TOKENS_RAW }}"
-          HF_ENDPOINTS_RAW="${{ secrets.HF_ENDPOINTS_RAW || '' }}"
 
           MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
           BASE_SLEEP="${BASE_SLEEP:-5}"
@@ -42,7 +37,7 @@ jobs:
             exit 0
           fi
 
-          # helper: split a raw string (comma or newline separated) into bash array
+          # helper: split string into bash array
           split_to_array() {
             raw="$1"
             mapfile -t arr < <(printf "%s" "$raw" | tr ',' '\n' | sed 's/\r//g' | sed '/^[[:space:]]*$/d')
@@ -52,16 +47,8 @@ jobs:
             printf '%s\0' "${arr[@]}"
           }
 
-          # populate arrays (注意用 -d '' 读取 NUL 分隔)
           IFS= read -r -d '' -a SPACES < <(split_to_array "$HF_SPACES_RAW") || true
           IFS= read -r -d '' -a TOKENS < <(split_to_array "$HF_TOKENS_RAW") || true
-          IFS= read -r -d '' -a ENDPOINTS < <(split_to_array "$HF_ENDPOINTS_RAW") || true
-
-          if [ ${#ENDPOINTS[@]} -lt ${#SPACES[@]} ]; then
-            for ((i=${#ENDPOINTS[@]}; i<${#SPACES[@]}; i++)); do
-              ENDPOINTS+=("")
-            done
-          fi
 
           if [ ${#SPACES[@]} -ne ${#TOKENS[@]} ]; then
             echo "::error::HF_SPACES and HF_TOKENS count mismatch (must be same number and order)"
@@ -71,83 +58,30 @@ jobs:
           fi
 
           echo "Found ${#SPACES[@]} spaces to process."
-          minute_utc=$(date -u +%M)
-          echo "Current UTC minute: $minute_utc"
-
           any_failed=0
 
           for idx in "${!SPACES[@]}"; do
             space="${SPACES[$idx]}"
             token="${TOKENS[$idx]}"
-            endpoint="${ENDPOINTS[$idx]:-}"
 
             echo "=============================="
             echo "Processing [$((idx+1))/${#SPACES[@]}] space: $space"
+
             safe_name="$(echo "$space" | sed 's/[^a-zA-Z0-9._-]/_/g')"
-            body_file="response_${safe_name}.json"
-            header_file="response_${safe_name}.headers"
             ping_body_file="ping_response_${safe_name}.txt"
             ping_header_file="ping_headers_${safe_name}.headers"
 
-            meta_api="https://huggingface.co/api/spaces/$space"
-            echo "Querying metadata: $meta_api"
-            meta_http=$(curl -sS -D "$header_file" -o "$body_file" -w "%{http_code}" \
-                        -H "Authorization: Bearer $token" \
-                        -H "Accept: application/json" \
-                        "$meta_api" || echo "000")
-            echo " -> metadata HTTP $meta_http, body bytes: $(wc -c < "$body_file" || echo 0)"
-
-            if [ "$meta_http" != "200" ]; then
-              echo "::warning::Failed to read metadata for $space (HTTP $meta_http). Will still attempt ping unless metadata indicates skip."
-            fi
-
-            hw_req=$(jq -r '.runtime.hardware.requested // .runtime.hardware.current // empty' "$body_file" 2>/dev/null || true)
-            runtime_stage=$(jq -r '.runtime.stage // empty' "$body_file" 2>/dev/null || true)
-            echo "runtime.stage: ${runtime_stage:-<empty>}"
-            echo "hardware.requested/current: ${hw_req:-<empty>}"
-
-            is_gpu=0
-            if echo "$hw_req" | grep -Eiq "t4|a10g|a100|l4|gpu|v100|p100|a40|l40"; then
-              is_gpu=1
-            fi
-
-            # 如果 GPU 且不是整点，跳过（视为 ok，不视为失败）
-            if [ "$is_gpu" -eq 1 ] && [ "$minute_utc" != "00" ]; then
-              echo "GPU space detected but current minute is $minute_utc (not :00) — skipping ping for this run (ok)."
-              rm -f "$body_file" "$header_file" || true
-              continue
-            fi
-
-            # 决定 ping URL & method
-            if [ -n "$endpoint" ]; then
-              ping_url="$endpoint"
-              method="POST"
-              data='{"data":["__hf_ping__"]}'
-            else
-              ping_url="$meta_api"
-              method="GET"
-              data=""
-            fi
-            echo "Ping URL: $ping_url (method: $method)"
+            # 🔹 访问项目首页
+            ping_url="https://${space}-${token}.hf.space/"
+            echo "Ping URL: $ping_url"
 
             success=0
             attempt=1
             while [ $attempt -le ${MAX_ATTEMPTS} ]; do
               echo "Ping attempt $attempt / ${MAX_ATTEMPTS} ..."
-              if [ "$method" = "GET" ]; then
-                code=$(curl -sS -D "$ping_header_file" -o "$ping_body_file" -w "%{http_code}" \
-                       -H "Authorization: Bearer $token" \
-                       -H "Accept: application/json" \
-                       --max-time 30 \
-                       "$ping_url" || echo "000")
-              else
-                code=$(curl -sS -D "$ping_header_file" -o "$ping_body_file" -w "%{http_code}" \
-                       -H "Authorization: Bearer $token" \
-                       -H "Content-Type: application/json" \
-                       -m 30 \
-                       -X POST -d "$data" \
-                       "$ping_url" || echo "000")
-              fi
+              code=$(curl -sS -L -D "$ping_header_file" -o "$ping_body_file" -w "%{http_code}" \
+                     --max-time 30 \
+                     "$ping_url" || echo "000")
 
               echo " -> HTTP $code, ping body bytes: $(wc -c < "$ping_body_file" || echo 0)"
               echo "---- ping headers (first 20 lines) ----"
@@ -156,14 +90,18 @@ jobs:
               head -c 200 "$ping_body_file" | sed -n '1,10p' || true
               echo "-------------------------------------------"
 
-              if echo "$code" | grep -E -q "^2"; then
-                echo "✅ Ping success (HTTP $code)."
-                success=1
-                break
-              fi
-
-              if [ "$code" = "401" ] || [ "$code" = "403" ]; then
-                echo "::warning::Ping returned $code — check the token permissions for $space."
+              if echo "$code" | grep -E -q "^(2|3)"; then
+                if grep -qi "gradio-app" "$ping_body_file" || grep -qi "gradio.js" "$ping_body_file"; then
+                  echo "✅ Space $space: 保活成功，项目首页在运行 (HTTP $code)"
+                  success=1
+                  break
+                elif grep -qi "Space is currently sleeping" "$ping_body_file"; then
+                  echo "::error::Space $space: 检测到休眠提示页面 (HTTP $code)"
+                  success=0
+                else
+                  echo "::warning::Space $space: 返回未知页面 (HTTP $code)，无法确认是否运行"
+                  success=0
+                fi
               fi
 
               if [ $attempt -lt ${MAX_ATTEMPTS} ]; then
@@ -175,18 +113,16 @@ jobs:
             done
 
             if [ $success -eq 1 ]; then
-              echo "Space $space: ping succeeded."
-              rm -f "$body_file" "$header_file" "$ping_body_file" "$ping_header_file" || true
+              rm -f "$ping_body_file" "$ping_header_file" || true
             else
-              echo "::error::Space $space: all ping attempts failed — leaving response files for artifact."
+              echo "::error::Space $space: 保活失败 — 所有尝试均失败"
               any_failed=1
-              # 保留文件供 artifact 上传
+              # 保留响应文件供 artifact 上传
             fi
 
             echo "=============================="
           done
 
-          # 写入 step 输出给后续步骤判断（注意：这里不用 exit 非 0）
           if [ $any_failed -eq 1 ]; then
             echo "any_failed=true" >> "$GITHUB_OUTPUT"
           else
@@ -194,10 +130,8 @@ jobs:
           fi
           exit 0
         env:
-          # 把需要的 secret 传给脚本
           HF_SPACES_RAW: ${{ secrets.HF_SPACES_RAW }}
           HF_TOKENS_RAW: ${{ secrets.HF_TOKENS_RAW }}
-          HF_ENDPOINTS_RAW: ${{ secrets.HF_ENDPOINTS_RAW || '' }}
 
       - name: Upload failure artifacts
         if: steps.ping.outputs.any_failed == 'true'
@@ -205,8 +139,6 @@ jobs:
         with:
           name: hf-space-failed-responses
           path: |
-            response_*.json
-            response_*.headers
             ping_response_*.txt
             ping_headers_*.headers
           retention-days: 3
@@ -214,5 +146,5 @@ jobs:
       - name: Fail job if any ping failed
         if: steps.ping.outputs.any_failed == 'true'
         run: |
-          echo "One or more Spaces failed ping. Failing the job as requested."
+          echo "One or more Spaces 保活失败. Failing the job as requested."
           exit 1
